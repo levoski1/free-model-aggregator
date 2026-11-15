@@ -176,7 +176,7 @@ async function handleInference(
       continue;
     }
 
-    recordProviderOutcome(routerState, cand.provider.id, true, parsed.status, true);
+    recordProviderOutcome(routerState, cand.provider.id, true, parsed.status, true, cand.ratingMilli);
 
     if (canonicalReq.stream) {
       const ssePayload = renderClientSse(clientWire, canonicalReq.clientModel, parsed.response);

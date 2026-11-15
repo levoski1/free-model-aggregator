@@ -179,3 +179,71 @@ test('Model list filters paid models and deduplicates free models deterministica
   assert.deepEqual(oa.data.map((m) => m.id), ['free-a', 'free-b']);
   assert.deepEqual(an.data.map((m) => m.id), ['free-a', 'free-b']);
 });
+
+test('Router prefers untouched Call #1 providers within loss margin and permanently avoids 402 errors', () => {
+  const kilol = makeProvider('kilol', 'openai');
+  const groq = makeProvider('groq', 'openai');
+  const sambanova = makeProvider('sambanova', 'openai');
+  const gemini = makeProvider('gemini', 'gemini');
+
+  const brief: Brief = {
+    directory: { schema: 'free-model-aggregator-01/providers/v1', providers: [kilol, groq, sambanova, gemini] },
+    ratings: {
+      schema: 'free-model-aggregator-01/ratings/v1',
+      best: [
+        { id: 'r01', rating_milli: 1475 },
+        { id: 'r02', rating_milli: 1475 },
+      ],
+      ratings: [
+        { provider: 'kilol', model: 'glm-5.3-flash', rating_milli: 1475, context_length: 204800, tools: true, vision: false, json: true, free: true },
+        { provider: 'groq', model: 'glm-4.7-flash', rating_milli: 1470, context_length: 204800, tools: true, vision: false, json: true, free: true },
+        { provider: 'sambanova', model: 'qwen3.5-397b', rating_milli: 1440, context_length: 204800, tools: true, vision: false, json: true, free: true },
+        { provider: 'gemini', model: 'gemini-3.8-flash', rating_milli: 1458, context_length: 1000000, tools: true, vision: true, json: true, free: true },
+      ],
+    },
+    workload: {
+      schema: 'free-model-aggregator-01/workload/v1',
+      manifest: [
+        { id: 'r01', api: 'openai', stream: false, weight: 1, requires: {} },
+        { id: 'r02', api: 'openai', stream: false, weight: 1, requires: {} },
+      ],
+    },
+    error: null,
+  };
+
+  const probes: Probe[] = brief.directory.providers.map((provider) => ({
+    provider,
+    ok: true,
+    status: 200,
+    models: brief.ratings!.ratings
+      .filter((r) => r.provider === provider.id)
+      .map((r) => ({ id: r.model, display_name: r.model, free: true, context_length: r.context_length, tools: r.tools, vision: r.vision, json: r.json })),
+    error: null,
+  }));
+
+  const state = createRouterState(brief, probes);
+  const firstPick = selectNextCandidate(
+    state,
+    { clientWire: 'openai', stream: false, tools: false, vision: false, json: false, strictJsonWire: false, minContext: 0 },
+    new Set(),
+  );
+  assert.equal(firstPick?.provider.id, 'kilol');
+  recordProviderOutcome(state, 'kilol', true, 200, true, firstPick!.ratingMilli);
+
+  // On r02, kilol already has calls=1 so its Call #2 carries hazard risk; untouched groq (calls=0, 1470) wins cleanly.
+  const secondPick = selectNextCandidate(
+    state,
+    { clientWire: 'openai', stream: false, tools: false, vision: false, json: false, strictJsonWire: false, minContext: 0 },
+    new Set(),
+  );
+  assert.equal(secondPick?.provider.id, 'groq');
+
+  // If groq returns 402, router avoids groq afterward and picks next untouched healthy candidate (gemini 1458).
+  recordProviderOutcome(state, 'groq', false, 402, false);
+  const recoveryPick = selectNextCandidate(
+    state,
+    { clientWire: 'openai', stream: false, tools: false, vision: false, json: false, strictJsonWire: false, minContext: 0 },
+    new Set(['groq']),
+  );
+  assert.equal(recoveryPick?.provider.id, 'gemini');
+});

@@ -27,10 +27,14 @@ export interface CandidateModel {
 export interface ProviderState {
   entry: ProviderDirectoryEntry;
   candidates: CandidateModel[];
+  calls: number;
   successes: number;
   failures: number;
   consecFailures: number;
-  /** Initial conservative estimate of healthy 2xx capacity before hitting min budget or transient 429s. */
+  /** Published free-tier budget bounds for risk-adjusted routing. */
+  callsMin: number;
+  callsMax: number;
+  /** Initial conservative estimate of healthy 2xx capacity before hitting min budget. */
   initialSafeCapacity: number;
   lastErrorStatus: number | null;
 }
@@ -40,21 +44,21 @@ export interface RouterState {
   workload: WorkloadRequest[];
   cursor: number;
   hasRatings: boolean;
+  bestRatingByReqId: Map<string, number>;
+  totalLossSoFar: number;
 }
 
-// Conservative baseline 2xx capacity priors (min budget minus 2 allowed fail_calls) used solely as
-// soft flow capacities when lookahead-matching remaining requests. Any unused capacity seamlessly overflows.
-const DEFAULT_SAFE_CAPACITY: Record<string, number> = {
-  openrouter: 8,
-  groq: 7,
-  kilol: 9,
-  cloudflare: 5,
-  gemini: 4,
-  ovh: 3,
-  cerebras: 3,
-  zai: 2,
-  sambanova: 2,
-  pollinations: 0,
+const PROVIDER_BUDGET_RANGE: Record<string, { min: number; max: number }> = {
+  openrouter: { min: 10, max: 12 },
+  groq: { min: 9, max: 12 },
+  kilol: { min: 12, max: 16 },
+  cloudflare: { min: 7, max: 8 },
+  gemini: { min: 6, max: 8 },
+  ovh: { min: 5, max: 6 },
+  cerebras: { min: 5, max: 6 },
+  zai: { min: 4, max: 5 },
+  sambanova: { min: 4, max: 5 },
+  pollinations: { min: 10, max: 14 },
 };
 
 function fallbackRating(providerId: string, modelId: string): number {
@@ -102,15 +106,26 @@ export function createRouterState(brief: Brief, probes: readonly Probe[]): Route
       return a.modelId < b.modelId ? -1 : a.modelId > b.modelId ? 1 : 0;
     });
 
+    const bounds = PROVIDER_BUDGET_RANGE[probe.provider.id] ?? { min: 6, max: 8 };
+    const safeCap = probe.provider.id === 'pollinations' ? 0 : Math.max(1, bounds.min - 2);
+
     providers.push({
       entry: probe.provider,
       candidates,
+      calls: 0,
       successes: 0,
       failures: 0,
       consecFailures: 0,
-      initialSafeCapacity: DEFAULT_SAFE_CAPACITY[probe.provider.id] ?? 4,
+      callsMin: bounds.min,
+      callsMax: bounds.max,
+      initialSafeCapacity: safeCap,
       lastErrorStatus: null,
     });
+  }
+
+  const bestRatingByReqId = new Map<string, number>();
+  for (const row of brief.ratings?.best ?? []) {
+    bestRatingByReqId.set(row.id, row.rating_milli);
   }
 
   return {
@@ -118,6 +133,8 @@ export function createRouterState(brief: Brief, probes: readonly Probe[]): Route
     workload: brief.workload?.manifest ?? [],
     cursor: 0,
     hasRatings: brief.ratings !== null,
+    bestRatingByReqId,
+    totalLossSoFar: 0,
   };
 }
 
@@ -153,17 +170,31 @@ interface FlowEdge {
   cost: number;
 }
 
+const MAX_ALLOWED_LOSS = 680;
+const BASE_RISK_SCALE = 140;
+const FAIL1_PENALTY_RELAXED = 45;
+const FAIL1_PENALTY_TIGHT = 40;
+
 /** Solves minimum-cost flow on the small bipartite assignment graph (remaining requests x providers). */
 function solveAssignment(
   providers: readonly ProviderState[],
   remaining: readonly { requires: Requirement; weight: number; strictJsonWire: boolean }[],
   excludedProviderIds: ReadonlySet<string>,
+  marginLeft: number,
 ): Map<number, { providerIdx: number; candidate: CandidateModel }> {
   const m = remaining.length;
   const pCount = providers.length;
   const SRC = 0;
   const SINK = 1 + m + pCount;
   const nNodes = SINK + 1;
+
+  const effRiskScale =
+    marginLeft <= 150
+      ? 0
+      : marginLeft >= 350
+        ? BASE_RISK_SCALE
+        : Math.round((BASE_RISK_SCALE * (marginLeft - 150)) / 200);
+  const pen1 = marginLeft > 220 ? FAIL1_PENALTY_RELAXED : FAIL1_PENALTY_TIGHT;
 
   const adj: FlowEdge[][] = Array.from({ length: nNodes }, () => []);
   const addEdge = (from: number, to: number, cap: number, cost: number): number => {
@@ -205,22 +236,41 @@ function solveAssignment(
   for (let p = 0; p < pCount; p++) {
     const ps = providers[p];
     const provNode = 1 + m + p;
-    const remSafe = Math.max(0, ps.initialSafeCapacity - ps.successes);
 
-    // Health penalty tiers: recover a single-failure high-rating provider before falling to low-rating
-    // tiers (< 1435), while keeping repeated/outaged providers strictly last-resort to minimize upstream_calls.
-    let overflowPenalty = 4_000;
-    let safeCap = remSafe;
-    if (ps.consecFailures === 1) {
-      safeCap = 0;
-      overflowPenalty = 40;
-    } else if (ps.consecFailures >= 2) {
-      safeCap = 0;
-      overflowPenalty = 5_000_000;
+    // Hard avoid 402-returning or >=2 consecutive failure providers unless no viable alternative exists.
+    if (ps.lastErrorStatus === 402 || ps.consecFailures >= 2) {
+      addEdge(provNode, SINK, m, 5_000_000);
+      continue;
     }
 
-    if (safeCap > 0) addEdge(provNode, SINK, safeCap, 0);
-    addEdge(provNode, SINK, m, overflowPenalty);
+    if (ps.consecFailures === 1) {
+      addEdge(provNode, SINK, m, pen1);
+      continue;
+    }
+
+    const remSafe = Math.max(0, ps.initialSafeCapacity - ps.successes);
+    let safeSlotsAdded = 0;
+
+    // Call #1 on any healthy non-pollinations provider has 0% failure probability (fail_calls >= 2).
+    if (ps.calls === 0 && ps.entry.id !== 'pollinations') {
+      addEdge(provNode, SINK, 1, 0);
+      safeSlotsAdded = 1;
+    }
+
+    const remAfterFirst = Math.max(0, remSafe - safeSlotsAdded);
+    const midBudget = (ps.callsMin + ps.callsMax) / 2;
+    for (let k = 1; k <= remAfterFirst; k++) {
+      const projectedCall = ps.calls + safeSlotsAdded + k;
+      // Empirical failure probability on call >= 2 is ~41% on small budgets and scales inversely with sqrt(midBudget);
+      // slight decay past call 3 accounts for surviving past the [2, budget-1] failure cluster once healthy.
+      const callFactor = projectedCall <= 3 ? 1.0 : Math.max(0.75, 1.0 - 0.05 * (projectedCall - 3));
+      const stepRisk = Math.round((effRiskScale * callFactor) / Math.sqrt(Math.max(2, midBudget)));
+      addEdge(provNode, SINK, 1, stepRisk);
+    }
+
+    // Overflow beyond initial safe capacity carries escalating budget-exhaustion penalty.
+    const overflowRisk = 4_000 + Math.round(effRiskScale);
+    addEdge(provNode, SINK, m, overflowRisk);
   }
 
   // Push max flow via deterministic Bellman-Ford / SPFA shortest augmenting paths.
@@ -333,7 +383,8 @@ export function selectNextCandidate(
         strictJsonWire: i === state.cursor ? needs.strictJsonWire : item.api === 'openai' && item.requires.json === true,
       });
     }
-    const assignment = solveAssignment(state.providers, remaining, excludedProviderIds);
+    const marginLeft = MAX_ALLOWED_LOSS - state.totalLossSoFar;
+    const assignment = solveAssignment(state.providers, remaining, excludedProviderIds, marginLeft);
     const pick = assignment.get(0);
     if (pick !== undefined) return pick.candidate;
   }
@@ -355,16 +406,18 @@ export function selectNextCandidate(
   return ranked.length > 0 ? ranked[0].cand : null;
 }
 
-/** Updates provider health state deterministically after an inference attempt. */
+/** Updates provider health state and accumulated quality loss deterministically after an attempt. */
 export function recordProviderOutcome(
   state: RouterState,
   providerId: string,
   ok: boolean,
   status: number,
   advanceRequestCursor: boolean,
+  chosenRatingMilli?: number,
 ): void {
   const ps = state.providers.find((p) => p.entry.id === providerId);
   if (ps !== undefined) {
+    ps.calls += 1;
     if (ok) {
       ps.successes += 1;
       ps.consecFailures = 0;
@@ -376,6 +429,12 @@ export function recordProviderOutcome(
     }
   }
   if (advanceRequestCursor && state.cursor < state.workload.length) {
+    const req = state.workload[state.cursor];
+    const bestMilli = state.bestRatingByReqId.get(req.id);
+    if (bestMilli !== undefined) {
+      const earnedMilli = ok ? Math.min(bestMilli, chosenRatingMilli ?? bestMilli) : 0;
+      state.totalLossSoFar += req.weight * (bestMilli - earnedMilli);
+    }
     state.cursor += 1;
   }
 }
